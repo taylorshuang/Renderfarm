@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 DrQueueIPython
 ==============
 
@@ -50,3 +51,6 @@ Copyright (C) 2011-2013 Andreas Schroeder
 
 Licensed under GNU General Public License version 3. See LICENSE for details.
 
+=======
+# Renderfarm
+>>>>>>> 4ba39fa0d088509dac54c46c93be5a3e4c7aeae9
