@@ -1,0 +1,1049 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Console management program for DrQueue.
+Copyright (C) 2012-2013 Andreas Schröder
+
+This file is part of DrQueue.
+
+Licensed under GNU General Public License version 3. See LICENSE for details.
+"""
+
+from __future__ import print_function
+
+import string, argparse, getpass, os, signal, subprocess, pkg_resources, sys
+import platform, time, socket, datetime, glob, pickle, psutil
+from collections import deque
+from pprint import pprint
+import DrQueue
+from DrQueue import Job as DrQueueJob
+from DrQueue import Client as DrQueueClient
+
+
+SIGTERM_SENT = False
+SIGINT_SENT = False
+MONGODB_PID = None
+IPCONTROLLER_PID = None
+SSH_PID = None
+IPENGINE_PID = None
+CACHE_TIME = 60
+ADMIN_USER = 'root'
+DRQUEUE_SSH_USER = ''
+DRQUEUE_ROOT_DEFAULT = '/usr/local/drqueue'
+LOCALHOST = False
+
+
+def main():
+    global DRQUEUE_ROOT_DEFAULT
+    global DRQUEUE_SSH_USER
+    global LOCALHOST
+
+    # create parent parser for global options
+    parent_parser = argparse.ArgumentParser(add_help=False)
+    parent_parser.add_argument("-v", "--verbose", action="store_true", dest="verbose", default=False, help="verbose output")
+    parent_parser.add_argument("--no-ssh", action="store_true", dest="no_ssh", help="don't use SSH tunnel to connect to master")
+
+    # create the top-level parser
+    parser = argparse.ArgumentParser(parents=[parent_parser])
+    subparsers = parser.add_subparsers(title="subcommands")
+
+
+    # create the parser for the job command
+    parser_job = subparsers.add_parser("job", help="job management", parents=[parent_parser])
+
+    # create the parsers for job subcommands and set their handler functions
+    subparsers_job = parser_job.add_subparsers(title="subcommands")
+    parser_job_list = subparsers_job.add_parser("list", help="list one or more jobs", parents=[parent_parser])
+    parser_job_list.set_defaults(func=job_list)
+    parser_job_add = subparsers_job.add_parser("add", help="add a new job", parents=[parent_parser])
+    parser_job_add.set_defaults(func=job_add)
+    parser_job_stop = subparsers_job.add_parser("stop", help="stop running job", parents=[parent_parser])
+    parser_job_stop.set_defaults(func=job_stop)
+    parser_job_kill = subparsers_job.add_parser("kill", help="kill running job", parents=[parent_parser])
+    parser_job_kill.set_defaults(func=job_kill)
+    parser_job_delete = subparsers_job.add_parser("delete", help="delete existing job", parents=[parent_parser])
+    parser_job_delete.set_defaults(func=job_delete)
+    parser_job_continue = subparsers_job.add_parser("continue", help="continue stopped job", parents=[parent_parser])
+    parser_job_continue.set_defaults(func=job_continue)
+    parser_job_rerun = subparsers_job.add_parser("rerun", help="rerun stopped job", parents=[parent_parser])
+    parser_job_rerun.set_defaults(func=job_rerun)
+    parser_job_rerun_interrupted_tasks = subparsers_job.add_parser("rerun_interrupted_tasks", help="rerun interrupted tasks", parents=[parent_parser])
+    parser_job_rerun_interrupted_tasks.set_defaults(func=job_rerun_interrupted_tasks)
+
+    # options for job list action
+    parser_job_list.add_argument("-i", "--id", dest="id", help="job id")
+    parser_job_list.add_argument("-n", "--name", dest="name", help="job name")
+
+    # options for job add action
+    parser_job_add.add_argument("-s", "--startframe", dest="startframe", default=1, help="first frame")
+    parser_job_add.add_argument("-e", "--endframe", dest="endframe", default=1, help="last frame")
+    parser_job_add.add_argument("-b", "--blocksize", dest="blocksize", default=1, help="size of block")
+    parser_job_add.add_argument("-n", "--name", dest="name", default=None, help="name of job")
+    parser_job_add.add_argument("-r", "--renderer", dest="renderer", help="render type (maya|blender|mentalray|custom)")
+    parser_job_add.add_argument("-f", "--scenefile", dest="scenefile", default=None, help="path to scenefile")
+    parser_job_add.add_argument("-p", "--pool", dest="pool", default=None, help="pool of computers")
+    parser_job_add.add_argument("-o", "--options", dest="options", default="{}", help="specific options for renderer as Python dict")
+    parser_job_add.add_argument("--retries", dest="retries", default=1, help="number of retries for every task")
+    parser_job_add.add_argument("--owner", dest="owner", default=getpass.getuser(), help="Owner of job. Default is current username.")
+    parser_job_add.add_argument("--os", dest="os", default=None, help="Operating system")
+    parser_job_add.add_argument("--minram", dest="minram", default=0, help="Minimal RAM in GB")
+    parser_job_add.add_argument("--mincores", dest="mincores", default=0, help="Minimal CPU cores")
+    parser_job_add.add_argument("--send-email", action="store_true", dest="send_email", default=False, help="Send notification email when job is finished")
+    parser_job_add.add_argument("--email-recipients", dest="email_recipients", default=None, help="Recipients for notification email")
+    parser_job_add.add_argument("--custom-command", dest="custom_command", default=None, help="Custom command")
+    parser_job_add.add_argument("-w", "--wait", action="store_true", dest="wait", default=False, help="wait for job to finish")
+    parser_job_add.set_defaults(func=job_add)
+
+    # options for job stop action
+    parser_job_stop.add_argument("-i", "--id", dest="id", help="job id")
+    parser_job_stop.add_argument("-n", "--name", dest="name", help="job name")
+
+    # options for job kill action
+    parser_job_kill.add_argument("-i", "--id", dest="id", help="job id")
+    parser_job_kill.add_argument("-n", "--name", dest="name", help="job name")
+
+    # options for job delete action
+    parser_job_delete.add_argument("-i", "--id", dest="id", help="job id")
+    parser_job_delete.add_argument("-n", "--name", dest="name", help="job name")
+
+    # options for job continue action
+    parser_job_continue.add_argument("-i", "--id", dest="id", help="job id")
+    parser_job_continue.add_argument("-n", "--name", dest="name", help="job name")
+
+    # options for job rerun action
+    parser_job_rerun.add_argument("-i", "--id", dest="id", help="job id")
+    parser_job_rerun.add_argument("-n", "--name", dest="name", help="job name")
+
+    # options for job rerun_interrupted_tasks action
+    parser_job_rerun_interrupted_tasks.add_argument("-i", "--id", dest="id", help="job id")
+    parser_job_rerun_interrupted_tasks.add_argument("-n", "--name", dest="name", help="job name")
+
+
+    # create the parser for the task command
+    parser_task = subparsers.add_parser("task", help="task management", parents=[parent_parser])
+
+    # create the parsers for task subcommands and set their handler functions
+    subparsers_task = parser_task.add_subparsers(title="subcommands")
+    parser_task_rerun = subparsers_task.add_parser("rerun", help="rerun task with ID 'tid' of job identified by ID 'id' or NAME 'n'", parents=[parent_parser])
+    parser_task_rerun.set_defaults(func=task_rerun)
+    parser_task_show = subparsers_task.add_parser("show", help="show task with ID 'tid'", parents=[parent_parser])
+    parser_task_show.set_defaults(func=task_show)
+
+    # options for task rerun action
+    parser_task_rerun.add_argument("-t", "--tid", dest="tid", help="task id")
+    parser_task_rerun.add_argument("-i", "--id", dest="id", help="job id")
+    parser_task_rerun.add_argument("-n", "--name", dest="name", help="job name")
+
+    # options for task show action
+    parser_task_show.add_argument("-t", "--tid", dest="tid", help="task id")
+
+
+    # create the parser for the computer command
+    parser_computer = subparsers.add_parser("computer", help="computer management", parents=[parent_parser])
+
+    # create the parsers for computer subcommands and set their handler functions
+    subparsers_computer = parser_computer.add_subparsers(title="subcommands")
+    parser_computer_list = subparsers_computer.add_parser("list", help="list known computers", parents=[parent_parser])
+    parser_computer_list.set_defaults(func=computer_list)
+    parser_computer_stop = subparsers_computer.add_parser("stop", help="stop computer", parents=[parent_parser])
+    parser_computer_stop.set_defaults(func=computer_stop)
+    parser_computer_pool = subparsers_computer.add_parser("pool", help="set pool membership of computers", parents=[parent_parser])
+    parser_computer_pool.set_defaults(func=computer_pool)
+
+    # options for computer list action
+    parser_computer_list.add_argument("-i", "--id", type=int, dest="id", help="computer id")
+
+    # options for computer stop action
+    parser_computer_stop.add_argument("-i", "--id", type=int, dest="id", help="computer id")
+
+    # options for computer pool action
+    parser_computer_pool.add_argument("-i", "--id", type=int, dest="id", help="computer id")
+    parser_computer_pool.add_argument("-p", "--pools", dest="pools", help="list of pools")
+
+    
+    # create the parser for the security command
+    parser_security = subparsers.add_parser("security", help="toggle IPython security permissions", parents=[parent_parser])
+
+    # create the parsers for security subcommands and set their handler functions
+    subparsers_security = parser_security.add_subparsers(title="subcommands")
+    parser_security_lock = subparsers_security.add_parser("lock", help="lock IPython security permissions", parents=[parent_parser])
+    parser_security_lock.set_defaults(func=security_lock)
+    parser_security_unlock = subparsers_security.add_parser("unlock", help="unlock IPython security permissions", parents=[parent_parser])
+    parser_security_unlock.set_defaults(func=security_unlock)
+
+
+    # create the parser for the master command
+    parser_master = subparsers.add_parser("master", help="start master daemon", parents=[parent_parser])
+    parser_master.set_defaults(func=master_daemon)
+
+
+    # create the parser for the slave command
+    parser_slave = subparsers.add_parser("slave", help="start slave daemon", parents=[parent_parser])
+    parser_slave.set_defaults(func=slave_daemon)
+
+    # options for slave command
+    parser_slave.add_argument("-n", "--no-restart", action="store_true", dest="no_restart", help="don't restart engine process automatically")
+
+
+    # parse arguments
+    args = parser.parse_args()
+
+    # debug parsed arguments
+    if args.verbose:
+        print('DEBUG: args:', args)
+
+    # check if DRQUEUE_ROOT is set
+    if "DRQUEUE_ROOT" not in os.environ:
+        if args.verbose:
+            print('DEBUG: DRQUEUE_ROOT environment variable is not set. Using default \'' + DRQUEUE_ROOT_DEFAULT + '\'.')
+        os.environ['DRQUEUE_ROOT'] = DRQUEUE_ROOT_DEFAULT
+
+    # set IPYTHONDIR depending on DRQUEUE_ROOT
+    ipython_dir = os.path.join(os.environ['DRQUEUE_ROOT'], 'ipython')
+    if args.verbose:
+        print('DEBUG: setting IPYTHONDIR to ' + ipython_dir)
+    os.environ['IPYTHONDIR'] = ipython_dir
+
+    # only run when not in master daemon mode
+    if args.func != master_daemon:
+        # use DRQUEUE_MASTER if set
+        if "DRQUEUE_MASTER" in os.environ:
+            if os.environ["DRQUEUE_MASTER"] in ['127.0.0.1', 'localhost']:
+                LOCALHOST = True
+            else:
+                LOCALHOST = False
+        else:
+            # determine DRQUEUE_MASTER from engine settings file
+            eo_file = os.path.join(os.environ['IPYTHONDIR'], 'profile_default/security/ipcontroller-engine.json')
+            for line in open(eo_file).readlines():
+                if 'ssh' in line:
+                    # extract master IP
+                    ssh_conn = line.split(':')[1].split('@')
+                    if len(ssh_conn) == 2:
+                        master = ssh_conn[1].split('\"')[0]
+                        if args.verbose:
+                            print('DEBUG: master address from ipcontroller-engine.json: ' + master)
+                        DRQUEUE_SSH_USER = ssh_conn[0].split('\"')[1]
+                        if args.verbose:
+                            print('DEBUG: SSH user from ipcontroller-engine.json: ' + DRQUEUE_SSH_USER)
+                        break
+                    else:
+                        continue
+                if 'interface' in line:
+                    # extract master IP
+                    tcp_conn = line.split(':')
+                    if len(tcp_conn) == 3:
+                        master = tcp_conn[2].split('//')[1].split('\"')[0]
+                        if args.verbose:
+                            print('DEBUG: master from ipcontroller-engine.json: ' + master)
+                        break
+                    else:
+                        master = '127.0.0.1'
+                        if args.verbose:
+                            print('DEBUG: master not found in ipcontroller-engine.json. Using ' + master + ' instead.')
+            # set DRQUEUE_MASTER in environment
+            os.environ["DRQUEUE_MASTER"] = master
+            # check if master IP is configured on this machine
+            conn = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            conn.connect((master, 1))
+            conn_ip = conn.getsockname()[0]
+            if args.verbose:
+                print('DEBUG: IP for connecting to master: ' + conn_ip)
+            # skip creation of SSH tunnel when on same host
+            if conn_ip == master:
+                LOCALHOST = True
+                if args.verbose:
+                    print('DEBUG: running on the same IP as DRQUEUE_MASTER')
+            else:
+                LOCALHOST = False
+
+    # start SSH tunnel for MongoDB connection
+    # skip if requested, if running master daemon or when on same host
+    if (args.no_ssh != True) and (args.func != master_daemon) and (LOCALHOST == False):
+        if args.verbose:
+            print('DEBUG: start_ssh_tunnel()')
+        start_ssh_tunnel(args.verbose)
+    else:
+        if args.verbose:
+            print('DEBUG: not starting SSH tunnel because either requested or running as master or running on same host')
+        # deactivate signal handling for SSH
+        SSH_PID = 0
+
+    # execute function bound to chosen subparser
+    args.func(args)
+
+
+def job_list(args):
+    # initialize DrQueue client
+    client = DrQueueClient()
+
+    job_id = args.id
+    job_name = args.name
+
+    if (job_id != None) and (job_name == None):
+        # fetch information about single job
+        jobs = [client.query_job_by_id(job_id)]
+        print("Listing job with id:", job_id)
+    elif (job_id == None) and (job_name != None):
+        # fetch information about single job
+        jobs = [client.query_job_by_name(job_name)]
+        print("Listing job with name:", job_name)
+    else:
+        # fetch a list of all jobs
+        jobs = client.query_job_list()
+        print("Listing all jobs")
+
+    if len(jobs) == 0:
+        print('No jobs found')
+        sys.exit(-1)
+
+    # run action on every job
+    for job in jobs:
+        # walk through tasks of every job
+        tasks = client.query_task_list(job['_id'])
+        meantime, time_left, finish_time = client.job_estimated_finish_time(job['_id'])
+        frame = job['startframe']
+        
+        print("\nJob \"%s\" (ID: %s):" % (job['name'], job['_id']))
+        print("Overall status: " + client.job_status(job['_id']))
+        print("Enabled: %s" % job['enabled'])
+        print("Submit time: " + str(job['submit_time']))
+        if job['requeue_time'] != False:
+            print("Requeue time: "+ str(job['requeue_time']))
+        print("Time per task: " + str(meantime))
+        if client.query_job_tasks_left(job['_id']) > 0:
+            print("Time left: " + str(time_left))
+            print("Estimated finish time: " + str(finish_time))
+        else:
+            print("Finish time: " + str(finish_time))
+        if 'pool_name' in job['limits']:
+        	print("Pool: " + str(job['limits']['pool_name']))
+        else:
+        	print("Pool: Not set.")
+        print("Task id\t\t\t\t\tframe\tstatus\towner\tcompleted at")
+        
+        for task in tasks:
+            tmsg_id = task['msg_id']
+            theader = task['header']
+            username = theader['username']
+        
+            if task['completed'] == None:
+                status = "pending"
+                print("%s\t%i\t%s\t%s" % (tmsg_id, frame, status, username))
+            else:
+                result_header = task['result_header']
+                result_content = task['result_content']
+                try:
+                    status = result_content['status']
+                except KeyError:
+                    status = 'error'
+                cpl = task['completed']
+                print("%s\t%i\t%s\t%s\t%i-%02i-%02i %02i:%02i:%02i" % (tmsg_id, frame, status, username, cpl.year, cpl.month, cpl.day, cpl.hour, cpl.minute, cpl.second))
+
+                if status == 'error':
+                    try:
+                        err_msg = result_content['evalue']
+                    except KeyError:
+                        err_msg = 'unknown'
+                	print('  Error was: ' + err_msg)
+            if int(job['blocksize']) > 1:
+            	frame += int(job['blocksize'])
+            else:
+            	frame += 1
+
+            if args.verbose:
+                print("DEBUG: \n" + str(task))
+
+
+def job_add(args):
+    # initialize DrQueue client
+    client = DrQueueClient()
+
+    # set limits
+    limits = dict()
+    limits['pool_name'] = args.pool
+    limits['os'] = args.os
+    limits['minram'] = int(args.minram)
+    limits['mincores'] = int(args.mincores)
+
+    options_var = eval(args.options)
+    options_var['send_email'] = args.send_email
+    options_var['email_recipients'] = args.email_recipients
+    options_var['custom_command'] = args.custom_command
+
+    # add standard Blender option
+    if (args.renderer == "blender") and ("rendertype" not in options_var):
+        options_var['rendertype'] = "animation"
+
+    # initialize DrQueue job
+    job = DrQueueJob(args.name, int(args.startframe), int(args.endframe), int(args.blocksize), args.renderer, args.scenefile, args.retries, args.owner, options_var, "drqueue", limits)
+
+    # run job with client
+    try:
+        client.job_run(job)
+    except ValueError:
+        print("One of your the specified values produced an error:")
+        raise
+        exit(1)
+
+    # tasks which have been created
+    tasks = client.query_task_list(job['_id'])
+
+    # wait for all tasks of job to finish
+    if args.wait:
+        if (tasks == []) and (client.query_computer_list() == []):
+            print("Tasks have been sent but no render node is running at the moment.")
+            exit(0)
+
+        for task in tasks:
+            ar = client.task_wait(task['msg_id'])
+            # add some verbose output
+            if args.verbose:
+                cpl = ar.metadata.completed
+                msg_id = ar.metadata.msg_id
+                status = ar.status
+                engine_id = ar.metadata.engine_id
+                print("Task %s finished with status '%s' on engine %i at %i-%02i-%02i %02i:%02i:%02i." % (msg_id, status, engine_id, cpl.year, cpl.month, cpl.day, cpl.hour, cpl.minute, cpl.second))
+                if ar.pyerr != None:
+                    print(ar.pyerr)
+        print("Job %s finished." % job['name'])
+
+
+def job_stop(args):
+    # initialize DrQueue client
+    client = DrQueueClient()
+
+    job_id = args.id
+    job_name = args.name
+
+    if (job_id != None) and (job_name == None):
+        # fetch information about single job
+        jobs = [client.query_job_by_id(job_id)]
+        print("Stopping job with id:", job_id)
+    elif (job_id == None) and (job_name != None):
+        # fetch information about single job
+        jobs = [client.query_job_by_name(job_name)]
+        print("Stopping job with name:", job_name)
+    else:
+        # fetch a list of all jobs
+        jobs = client.query_job_list()
+        print("Stopping all jobs")
+
+    # run action on every job
+    for job in jobs:
+        client.job_stop(job['_id'])
+        print("Job %s has been stopped.\n" % job['name'])
+
+
+def job_kill(args):
+    # initialize DrQueue client
+    client = DrQueueClient()
+
+    job_id = args.id
+    job_name = args.name
+
+    if (job_id != None) and (job_name == None):
+        # fetch information about single job
+        jobs = [client.query_job_by_id(job_id)]
+        print("Killing job with id:", job_id)
+    elif (job_id == None) and (job_name != None):
+        # fetch information about single job
+        jobs = [client.query_job_by_name(job_name)]
+        print("Killing job with name:", job_name)
+    else:
+        # fetch a list of all jobs
+        jobs = client.query_job_list()
+        print("Killing all jobs")
+
+    # run action on every job
+    for job in jobs:
+        client.job_kill(job['_id'])
+        print("Job %s has been killed.\n" % job['name'])
+
+
+def job_delete(args):
+    # initialize DrQueue client
+    client = DrQueueClient()
+
+    job_id = args.id
+    job_name = args.name
+
+    if (job_id != None) and (job_name == None):
+        # fetch information about single job
+        jobs = [client.query_job_by_id(job_id)]
+        print("Deleting job with id:", job_id)
+    elif (job_id == None) and (job_name != None):
+        # fetch information about single job
+        jobs = [client.query_job_by_name(job_name)]
+        print("Deleting job with name:", job_name)
+    else:
+        # fetch a list of all jobs
+        jobs = client.query_job_list()
+        print("Deleting all jobs")
+
+    # run action on every job
+    for job in jobs:
+        if job == None:
+            print('ERROR: No such job')
+            sys.exit(-1)
+        if client.job_delete(job['_id']) == True:
+            print("Job %s has been deleted.\n" % job['name'])
+        else:
+            print("Job %s could not be deleted.\n" % job['name'])
+
+
+def job_continue(args):
+    # initialize DrQueue client
+    client = DrQueueClient()
+
+    job_id = args.id
+    job_name = args.name
+
+    if (job_id != None) and (job_name == None):
+        # fetch information about single job
+        jobs = [client.query_job_by_id(job_id)]
+        print("Continuing job with id:", job_id)
+    elif (job_id == None) and (job_name != None):
+        # fetch information about single job
+        jobs = [client.query_job_by_name(job_name)]
+        print("Continuing job with name:", job_name)
+    else:
+        # fetch a list of all jobs
+        jobs = client.query_job_list()
+        print("Continuing all jobs")
+
+    # run action on every job
+    for job in jobs:
+        client.job_continue(job['_id'])
+        print("Job %s is running again.\n" % job['name'])
+
+
+def job_rerun(args):
+    # initialize DrQueue client
+    client = DrQueueClient()
+
+    job_id = args.id
+    job_name = args.name
+
+    if (job_id != None) and (job_name == None):
+        # fetch information about single job
+        jobs = [client.query_job_by_id(job_id)]
+        print("Rerunning job with id:", job_id)
+    elif (job_id == None) and (job_name != None):
+        # fetch information about single job
+        jobs = [client.query_job_by_name(job_name)]
+        print("Rerunning job with name:", job_name)
+    else:
+        # fetch a list of all jobs
+        jobs = client.query_job_list()
+        print("Rerunning all jobs")
+
+    # run action on every job
+    for job in jobs:
+        client.job_rerun(job['_id'])
+        print("Job %s is running another time.\n" % job['name'])
+
+
+def job_rerun_interrupted_tasks(args):
+    # initialize DrQueue client
+    client = DrQueueClient()
+
+    job_id = args.id
+    job_name = args.name
+
+    if (job_id != None) and (job_name == None):
+        # fetch information about single job
+        jobs = [client.query_job_by_id(job_id)]
+        print("Rerunning interrupted tasks of job with id:", job_id)
+    elif (job_id == None) and (job_name != None):
+        # fetch information about single job
+        jobs = [client.query_job_by_name(job_name)]
+        print("Rerunning interrupted tasks of job with name:", job_name)
+    else:
+        # fetch a list of all jobs
+        jobs = client.query_job_list()
+        print("Rerunning interrupted tasks of all jobs")
+
+    # run action on every job
+    for job in jobs:
+        client.job_rerun_interrupted_tasks(job['_id'])
+        print("Interrupted tasks of job %s are running another time.\n" % job['name'])
+
+
+def task_rerun(args):
+    # initialize DrQueue client
+    client = DrQueueClient()
+
+    job_id = args.id
+    job_name = args.name
+
+    if (job_id != None) and (job_name == None):
+        # fetch information about single job
+        jobs = [client.query_job_by_id(job_id)]
+        print("Rerunning interrupted tasks of job with id:", job_id)
+    elif (job_id == None) and (job_name != None):
+        # fetch information about single job
+        jobs = [client.query_job_by_name(job_name)]
+        print("Rerunning interrupted tasks of job with name:", job_name)
+    else:
+        # fetch a list of all jobs
+        jobs = client.query_job_list()
+        print("Rerunning interrupted tasks of all jobs")
+
+    # work on task id
+    if args.tid != 0:
+        client.task_rerun(args.tid)
+        print("Task %s of job %s is running another time." % (args.tid, jobs[0]['name']))
+    else:
+        print("Please specify a task id.")
+        sys.exit(-1)
+
+
+def task_show(args):
+    # initialize DrQueue client
+    client = DrQueueClient()
+    from IPython.parallel import error
+    from IPython.utils import pickleutil
+
+    # work on task id
+    if args.tid != None:
+        task = client.query_task(args.tid)
+        task2 = task
+        task2['buffers'][3] = str(pickle.loads(task['buffers'][3]))
+        print("Task %s has the following contents:\n" % args.tid)
+        pprint(task2)
+
+        if task['pyerr'] != None:
+            e = error.unwrap_exception(task['pyerr'])
+            e.print_traceback()
+    else:
+        print("Please specify a task id.")
+        sys.exit(-1)
+
+
+def computer_list(args):
+    global CACHE_TIME
+
+    # initialize DrQueue client
+    client = DrQueueClient()
+
+    computer_id = args.id
+
+    if computer_id != None:
+        # fetch information about single computer
+        computers = [computer_id]
+        print("Listing computer with id:", computer_id)
+    else:
+        # fetch a list of all computers
+        computers = client.ip_client.ids
+        print("Listing all computers")
+
+    for comp_id in computers:
+        print("Engine %s:" % comp_id)
+        comp = client.identify_computer(comp_id, CACHE_TIME)
+        if comp == None:
+            print(" Engine is blocked. Try again later.")
+        else:
+            print(" hostname: " + comp['hostname'])
+            print(" address: " + comp['address'])
+            print(" arch: " + comp['arch'])
+            print(" os: " + comp['os'])
+            print(" proctype: " + str(comp['proctype']))
+            print(" nbits: " + str(comp['nbits']))
+            print(" procspeed: " + str(comp['procspeed']))
+            print(" ncpus: " + str(comp['ncpus']))
+            print(" ncorescpu: " + str(comp['ncorescpu']))
+            print(" memory: " + str(comp['memory']) + " GB")
+            print(" load: " + comp['load'])
+            print(" pools: " + ','.join(comp['pools']))
+            try:
+                status = client.ip_client.queue_status(comp_id, verbose=True)
+            except IndexError:
+                status = {'queue': 'ERROR', 'completed': 'ERROR', 'tasks': 'ERROR'}
+            print(" status:")
+            print("  in queue: " + str(status['queue']))
+            print("  completed: " + str(status['completed']))
+            print("  tasks: " + str(status['tasks']))
+
+
+def computer_stop(args):
+    # initialize DrQueue client
+    client = DrQueueClient()
+
+    computer_id = args.id
+
+    if computer_id != None:
+        # fetch information about single computer
+        computers = [computer_id]
+        print("Stopping computer with id:", computer_id)
+    else:
+        # fetch a list of all computers
+        computers = client.ip_client.ids
+        print("Stopping all computers")
+
+    for computer in computers:
+        client.engine_stop(computer)
+        print("Computer %s has been stopped." % computer)
+
+
+def computer_pool(args):
+    global CACHE_TIME
+
+    # initialize DrQueue client
+    client = DrQueueClient()
+
+    computer_id = args.id
+
+    if computer_id != None:
+        # fetch information about single computer
+        computers = [computer_id]
+        print("Setting pools for computer with id:", computer_id)
+    else:
+        # fetch a list of all computers
+        computers = client.ip_client.ids
+        print("Setting pools for all computers")
+
+    if args.pools == None:
+        print("Please specify one or more pools.")
+        sys.exit(-1)
+
+    for comp_id in computers:
+        print("Engine %s:" % comp_id)
+        comp = client.identify_computer(comp_id, CACHE_TIME)
+        if comp == None:
+            print(" Engine is blocked. Try again later.")
+        else:
+            client.computer_set_pools(comp, args.pools.split(","))
+            print("Computer %i has been added to pools %s." % (comp_id, args.pools.split(",")))
+
+
+def recursive_permissions(path, filemode, dirmode, uid=-1, gid=-1):
+    # Recursively updates permissions on a given path.
+    # UID and GID default to -1, and mode is required
+    try:
+        os.chown(path,uid,gid)
+        os.chmod(path,dirmode)
+    except:
+        print('Directory permissions on {0} not updated due to error.'.format(path))
+    for item in glob.glob(path + '/*'):
+        print(item)
+        if os.path.isdir(item):
+            try:
+                os.chown(os.path.join(path,item),uid,gid)
+                os.chmod(os.path.join(path,item),dirmode)
+            except:
+                print('Directory permissions on {0} not updated due to error.'.format(os.path.join(path,item)))
+            recursive_permissions(os.path.join(path,item),filemode,dirmode,uid,gid)
+        else:
+            try:
+                os.chown(os.path.join(path,item),uid,gid)
+                os.chmod(os.path.join(path,item),filemode)
+            except:
+                print('File permissions on {0} not updated due to error.'.format(os.path.join(path,item)))
+
+
+def security_lock(args):
+    global ADMIN_USER
+
+    sec_dir = os.path.join(os.environ["DRQUEUE_ROOT"], "ipython", "profile_default", "security")
+    print("Will lock " + sec_dir)
+    recursive_permissions(sec_dir, 644, 755, ADMIN_USER, ADMIN_USER)
+
+
+def security_unlock(args):
+    global DRQUEUE_USER
+
+    sec_dir = os.path.join(os.environ["DRQUEUE_ROOT"], "ipython", "profile_default", "security")
+    print("Will unlock " + sec_dir)
+    recursive_permissions(sec_dir, 644, 755, DRQUEUE_USER, DRQUEUE_USER)
+
+
+def is_port_open(ip, port):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.connect((ip, int(port)))
+        s.shutdown(2)
+        return True
+    except:
+        return False
+
+
+def master_sig_handler(signum, frame):
+    global MONGODB_PID
+    global IPCONTROLLER_PID
+
+    if signum == signal.SIGINT:
+        sys.stderr.write("Received SIGINT. Shutting Down.\n")
+        global SIGINT_SENT
+        if not SIGINT_SENT:
+            SIGINT_SENT = True
+            if IPCONTROLLER_PID > 0:
+                sys.stderr.write("Sending INT to IPython controller.\n")
+                os.kill(IPCONTROLLER_PID, signal.SIGINT)
+                os.waitpid(IPCONTROLLER_PID, 0)
+            if MONGODB_PID > 0:
+                sys.stderr.write("Sending INT to MongoDB.\n")
+                os.kill(MONGODB_PID, signal.SIGINT)
+                os.waitpid(MONGODB_PID, 0)
+
+    if signum == signal.SIGTERM:
+        sys.stderr.write("Received SIGTERM. Shutting Down.\n")
+        global SIGTERM_SENT
+        if not SIGTERM_SENT:
+            SIGTERM_SENT = True
+            if IPCONTROLLER_PID > 0:
+                sys.stderr.write("Sending TERM to IPython controller.\n")
+                os.kill(IPCONTROLLER_PID, signal.SIGTERM)
+                os.waitpid(IPCONTROLLER_PID, 0)
+            if MONGODB_PID > 0:
+                sys.stderr.write("Sending TERM to MongoDB.\n")
+                os.kill(MONGODB_PID, signal.SIGTERM)
+                os.waitpid(MONGODB_PID, 0)
+
+    sys.exit()
+
+
+def slave_sig_handler(signum, frame):
+    global SSH_PID
+    global IPENGINE_PID
+
+    # handle SIGINT
+    if signum == signal.SIGINT:
+        sys.stderr.write("Received SIGINT. Shutting Down.\n")
+        global SIGINT_SENT
+        if not SIGINT_SENT:
+            SIGINT_SENT = True
+            if IPENGINE_PID > 0:
+                sys.stderr.write("Sending INT to IPython engine.\n")
+                os.kill(IPENGINE_PID, signal.SIGINT)
+                os.waitpid(IPENGINE_PID, 0)
+            if SSH_PID > 0:
+                sys.stderr.write("Sending INT to SSH.\n")
+                os.kill(SSH_PID, signal.SIGINT)
+                os.waitpid(SSH_PID, 0)
+
+    # handle SIGTERM
+    if signum == signal.SIGTERM:
+        sys.stderr.write("Received SIGTERM. Shutting Down.\n")
+        global SIGTERM_SENT
+        if not SIGTERM_SENT:
+            SIGTERM_SENT = True
+            if IPENGINE_PID > 0:
+                sys.stderr.write("Sending TERM to IPython engine.\n")
+                os.kill(IPENGINE_PID, signal.SIGTERM)
+                os.waitpid(IPENGINE_PID, 0)
+            if SSH_PID > 0:
+                sys.stderr.write("Sending TERM to SSH.\n")
+                os.kill(SSH_PID, signal.SIGTERM)
+                os.waitpid(SSH_PID, 0)
+
+    sys.exit()
+
+
+def run_command(command, logfile):
+    try:
+        p = subprocess.Popen(command, shell=True, stdout=logfile, stderr=subprocess.STDOUT)
+    except OSError as e:
+        errno, strerror = e.args
+        message = "OSError({0}) while executing command: {1}\n".format(errno, strerror)
+        logfile.write(message)
+        raise OSError(message)
+        return False
+    return p
+
+
+def master_daemon(args):
+    global MONGODB_PID
+    global IPCONTROLLER_PID
+
+    # run on specific IP if requested
+    if "DRQUEUE_MASTER" in os.environ:
+        master_ip = os.environ["DRQUEUE_MASTER"]
+    else:
+        master_ip = socket.gethostbyname(socket.getfqdn())
+
+    signal.signal(signal.SIGTERM, master_sig_handler)
+    signal.signal(signal.SIGINT, master_sig_handler)
+
+    pid = os.getpid()
+    print("Running DrQueue master on " + master_ip + " with PID " + str(pid) + ".")
+
+    # SSH user engines and clients should use
+    if 'DRQUEUE_SSH_USER' in os.environ:
+        ssh_user = os.environ['DRQUEUE_SSH_USER']
+    else:
+        # use current user
+        ssh_user = os.environ['USER']
+
+    if 'DRQUEUE_MONGODB' in os.environ:
+        mongo_ip = os.environ['DRQUEUE_MONGODB']
+    else:
+        mongo_ip = '127.0.0.1'
+
+    if mongo_ip == "127.0.0.1":
+        # start MongoDB daemon on localhost
+        command = "mongod --dbpath $IPYTHONDIR/db --rest --bind_ip 127.0.0.1"
+    else:
+        # start MongoDB daemon on locahost and master IP
+        command = "mongod --dbpath $IPYTHONDIR/db --rest --bind_ip 127.0.0.1," + mongo_ip
+
+    mongodb_logpath = os.path.join(os.environ["DRQUEUE_ROOT"], "logs", "mongodb.log")
+    mongodb_logfile = open(mongodb_logpath, "ab")
+    mongodb_daemon = run_command(command, mongodb_logfile)
+    MONGODB_PID = mongodb_daemon.pid
+    print("MongoDB started on " + mongo_ip + " with PID " + str(mongodb_daemon.pid) + ". Logging to " + mongodb_logpath + ".")
+
+    # wait until port 27017 of MongoDB is available
+    mongodb_available = False
+    while mongodb_available == False:
+        mongodb_available = is_port_open("127.0.0.1", 27017)
+        time.sleep(2)
+        print("Waiting for MongoDB to start up . . . ")
+
+    # start IPython controller
+    if args.no_ssh == True:
+        # clients and engines have to connect directly
+        command = "ipcontroller --url tcp://" + master_ip + ":10101 --mongodb"
+    else:
+        # clients and engines have to connect through SSH tunnels
+        command = "ipcontroller --url tcp://127.0.0.1:10101 --ssh=" + ssh_user + "@" + master_ip + " --enginessh=" + ssh_user + "@" + master_ip + " --mongodb"
+
+    if args.verbose:
+        print('DEBUG: command:', command)
+
+    ipcontroller_logpath = os.path.join(os.environ["DRQUEUE_ROOT"], "logs", "ipcontroller.log")
+    ipcontroller_logfile = open(ipcontroller_logpath, "ab")
+    ipcontroller_daemon = run_command(command, ipcontroller_logfile)
+    IPCONTROLLER_PID = ipcontroller_daemon.pid
+    print("IPython controller started with PID " + str(ipcontroller_daemon.pid) + ". Logging to " + ipcontroller_logpath + ".")
+
+    # wait for any child to exit
+    os.wait()
+
+
+def slave_daemon(args):
+    global IPENGINE_PID
+    global LOCALHOST
+
+    # connect to specific master if requested
+    if "DRQUEUE_MASTER" not in os.environ:
+        sys.stderr.write("slave_daemon: DRQUEUE_MASTER environment variable is not set!\n")
+        sys.exit(-1)
+    else:
+        master_ip = os.environ["DRQUEUE_MASTER"]
+
+    # connect from specific slave IP if requested
+    if "DRQUEUE_SLAVE" in os.environ:
+        slave_ip = os.environ["DRQUEUE_SLAVE"]
+    else:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((master_ip, 1))
+        slave_ip = s.getsockname()[0]
+
+    ipengine_logpath = os.path.join(os.environ["DRQUEUE_ROOT"], "logs", "ipengine_" + slave_ip + ".log")
+    ipengine_logfile = open(ipengine_logpath, "ab")
+
+    # register signal handler for SIGINT & SIGTERM
+    signal.signal(signal.SIGTERM, slave_sig_handler)
+    signal.signal(signal.SIGINT, slave_sig_handler)
+
+    pid = os.getpid()
+    print("Running DrQueue slave on " + slave_ip + " with PID " + str(pid) + ".")
+
+    # restart ipengine if it was shut down by IPython
+    while True:
+        # start IPython engine along with startup script
+        print("Connecting to DrQueue master at " + master_ip + ".")
+        command = "ipengine -s get_slave_information.py"
+
+        if (args.no_ssh == True) or LOCALHOST:
+            command += " --ssh="
+
+        if args.verbose:
+            print('DEBUG: command:', command)
+
+        ipengine_daemon = run_command(command, ipengine_logfile)
+        IPENGINE_PID = ipengine_daemon.pid
+        print("IPython engine started with PID " + str(IPENGINE_PID) + ". Logging to " + ipengine_logpath + ".")
+
+        # wait for process to exit
+        returncode = ipengine_daemon.wait()
+        print("IPython was shut down with returncode: %s" % returncode)
+
+        # run only once if option given
+        if args.no_restart == True:
+            break
+        else:
+            sec = 5
+            print("Restarting IPython after %s sec..." % sec)
+            time.sleep(sec)
+
+
+def process_exists(process_name):
+    for proc in psutil.process_iter():
+        try:
+            pinfo = proc.as_dict(attrs=['pid', 'cmdline'])
+        except psutil.NoSuchProcess:
+            pass
+        else:
+            if pinfo['cmdline'] is not None:
+                cmdline = " ".join(pinfo['cmdline'])
+                if process_name in cmdline:
+                    return True
+    return False
+
+
+def start_ssh_tunnel(verbose):
+    global SSH_PID
+    global DRQUEUE_SSH_USER
+
+    # register signal handler for SIGINT & SIGTERM
+    signal.signal(signal.SIGTERM, slave_sig_handler)
+    signal.signal(signal.SIGINT, slave_sig_handler)
+
+    if "DRQUEUE_MASTER" not in os.environ:
+        sys.stderr.write("start_ssh_tunnel: DRQUEUE_MASTER environment variable is not set!\n")
+        sys.exit(-1)
+    else:
+        master_ip = os.environ["DRQUEUE_MASTER"]
+
+    if "DRQUEUE_SLAVE" in os.environ:
+        slave_ip = os.environ["DRQUEUE_SLAVE"]
+    else:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect((master_ip, 1))
+        slave_ip = s.getsockname()[0]
+
+    # overwrite if requested
+    if 'DRQUEUE_SSH_USER' in os.environ:
+        ssh_user = os.environ['DRQUEUE_SSH_USER']
+    else:
+        ssh_user = DRQUEUE_SSH_USER
+
+    # start SSH tunnel for MongoDB connection
+    command = "/usr/bin/ssh -o ServerAliveInterval=30 -L 127.0.0.1:27017:127.0.0.1:27017 " + ssh_user + "@" + master_ip + " cat -"
+
+    if verbose:
+        print('DEBUG: command:', command)
+
+    if process_exists(command):
+        print("SSH tunnel process is already running.")
+        return
+
+    ssh_tunnel_logpath = os.path.join(os.environ["DRQUEUE_ROOT"], "logs", "ssh_tunnel_logfile_" + slave_ip + ".log")
+    ssh_tunnel_logfile = open(ssh_tunnel_logpath, "ab")
+    ssh_tunnel_client = run_command(command, ssh_tunnel_logfile)
+    SSH_PID = ssh_tunnel_client.pid
+    print("SSH tunnel started with PID " + str(ssh_tunnel_client.pid) + ". Logging to " + ssh_tunnel_logpath + ".")
+
+    # wait until port 27017 of MongoDB is available
+    mongodb_available = False
+    while mongodb_available == False:
+        mongodb_available = is_port_open("127.0.0.1", 27017)
+        time.sleep(2)
+        print("Waiting for SSH tunnel to start up . . . ")
+
+
+if __name__ == "__main__":
+    main()
